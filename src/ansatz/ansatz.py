@@ -2,42 +2,156 @@ from src.exceptions.exceptions import *
 import numpy as np
 from qiskit import Aer
 from qiskit.aqua import Operator
-from enum import Enum
+from enum import IntEnum
 from qiskit.aqua import QuantumInstance
 from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit
+from qiskit.aqua.operator import Operator
 
 
-class Ansatz:
-    def __init__(self, num_qubits: int, qubit_operator: Operator, backend: str="statevector_simulator",
-                 log: bool=False, verbose: bool=False, shots: int=1024):
+class CircuitCell:
+    def __init__(self, gate_type, is_target: bool, qubit_index: int=None, depth_index: int=None, parameters=None):
+        """
+        :param gate_type: What type the gate is. Currently, controls are only supported as identity gates.
+        :param is_target: Any gate which is not a control, is a target. I.e. a target may have 0 or more controls.
+        """
+        self.__is_target = is_target
+        self.__gate_type = _GateType.get_gate_type_from_string(gate_type)
+        if parameters is None:
+            self.__parameters = []
+        else:
+            assert 0 <= len(parameters) <= 3, "[ASSERTION FAILURE] Gates with more than three parameters are not" \
+                                              + "supported."
+            self.__parameters = parameters
+
+        if qubit_index is not None and depth_index is not None:
+            self.__qubit = qubit_index
+            self.__depth = depth_index
+        elif (qubit_index is None) != (depth_index is None):
+            raise AssertionError("[ASSERTION FAILURE] If layer or qubit is specified, the qubit or layer must also be"
+                                 + "specified. Cannot specify one without the other.")
+        else:
+            self.__qubit = self.__depth = None
+        # The next target or control. If this is a target, this should always be None.
+        self.__next_cell = None
+        # The previous control, noting that a previous cell can never be a target.
+        self.__prev_cell = None
+
+    def has_parameters(self):
+        return self.get_param_count() > 0
+
+    def get_param_count(self):
+        return len(self.__parameters)
+
+    def get_parameters(self):
+        return self.__parameters
+
+    def set_parameters(self, parameters):
+        assert 0 <= len(parameters) <= 3, "[ASSERTION FAILURE] Gates with more than three parameters are not" \
+                                          + "supported."
+        gate_type_str = _GateType.get_string_from_gate_type(self.__gate_type)
+        gate_type_param_req = _GateType.get_gate_type_param_count(gate_type_str)
+        assert gate_type_param_req == len(parameters), "[ASSERTION FAILURE] Gate type (" + gate_type_str \
+                                                       + ") requires " + str(gate_type_param_req) \
+                                                       + " parameters instead of " + str(len(parameters)) + "."
+        self.__parameters = parameters
+
+    def is_target(self):
+        return self.__is_target
+
+    def get_qubit(self):
+        return self.__qubit
+
+    def get_depth(self):
+        return self.__depth
+
+    def get_next_cell(self):
+        return self.__next_cell
+
+    def get_prev_cell(self):
+        return self.__prev_cell
+
+    def get_gate_name(self):
+        return _GateType.get_string_from_gate_type(self._get_type())
+
+    def _get_type(self):
+        return self.__gate_type
+
+    def _set_next_cell(self, cell):
+        # This cell cannot link to another cell if this is a target, as targets are assumed to be terminal.
+        assert not self.__is_target, "[ASSERTION FAILURE] Cannot set a linked cell for a terminal target gate."
+        assert cell is not None, "[ASSERTION FAILURE] Cannot set next cell to None, is None by default."
+        self.__next_cell = cell
+
+    def _set_prev_cell(self, cell):
+        self.__prev_cell = cell
+
+
+class AnsatzOperator:
+    def __init__(self, num_qubits: int, backend: str="statevector_simulator", shots: int=1024):
         self.__num_qubits = num_qubits
-        self.__qubit_operator = qubit_operator
         if backend == "statevector_simulator":
             self.__backend = Aer.get_backend(backend)
             self.__mode = "matrix"
             self.__quantum_instance = QuantumInstance(backend=self.__backend)
+            self.__operator = Matrix
         elif backend == "qasm_simulator":
             self.__backend = Aer.get_backend(backend)
             self.__mode = "grouped_paulis"
             self.__quantum_instance = QuantumInstance(backend=self.__backend, shots=shots)
         else:
             raise UnrecognizedInputError
-        self.__abstract_quantum_circuit = _QuantumCircuitRepresentation(self.__num_qubits, backend)
 
     def get_num_qubits(self):
         return self.__num_qubits
 
+    def get_backend(self):
+        return self.__backend
+
+    def get_mode(self):
+        return self.__mode
+
+    def get_operator(self):
+        return self.__operator
+
+
+class Ansatz:
+    def __init__(self, ansatz_operator: AnsatzOperator, log: bool=False, verbose: bool=False):
+        self.__num_qubits = ansatz_operator.get_num_qubits()
+        self.__verbose = verbose
+        self.__qubit_operator = ansatz_operator.get_operator()
+
+        self.__abstract_quantum_circuit = _QuantumCircuitRepresentation(self.__num_qubits, backend)
+
+    def __getitem__(self, key) -> CircuitCell:
+        """
+        Accepts a key, indexed by [depth, qubit], and returns the CircuitCell object at the specified location.
+        """
+        assert len(key) == 2, "[ASSERTION FAILURE] Attempted to index into an Ansatz object without specifying" \
+                              + "depth and qubit."
+        depth = key[0]
+        qubit = key[1]
+        cell = self.__abstract_quantum_circuit.get_quantum_cell(depth, qubit)
+        return cell
+
+    def get_num_qubits(self):
+        return self.__num_qubits
+
+    def get_depth(self):
+        return self.__abstract_quantum_circuit.get_depth()
+
     def get_quantum_circuit(self):
         return self.__abstract_quantum_circuit.get_quantum_circuit()
 
-    def cost_function(self, params):
+    def cost_function(self):
         """
-        :param params: Either an abstract representation of the Ansatz containing all applicable parameters, or a
-                       list if `advanced_params=False`.
-        :return: The cost evaluation of the Ansatz with the given parameterization.
+        Even though this method directly calls the private cost function method, this additional method has been added
+        to enable a planned change without breaking the API.
+        :return: The cost evaluation of the Ansatz with its current parameterization.
         """
-        self.__set_parameters(params)
-        return self.__cost_function()
+        cost = self.__cost_function()
+        if self.__verbose:
+            print(cost)
+        return cost
 
     def append_layer(self, layer):
         """
@@ -45,15 +159,6 @@ class Ansatz:
         :param layer: layer must be of the format, [["gate_name: string, target: int, control_list: list, params: list],...]
         """
         self.__abstract_quantum_circuit.append_layer(layer)
-
-    def get_type_of_cell_at_coordinates(self, depth, qubit):
-        """
-        Gives the type of the cell at the specified coordinates.
-        :param depth: circuit depth.
-        :param qubit: qubit at the given circuit depth.
-        :return: A string representing the type of the cell.
-        """
-        raise NotImplementedError
 
     def __cost_function(self):
         """
@@ -67,17 +172,8 @@ class Ansatz:
         mean = np.real(mean)
         return mean
 
-    def __set_parameters(self, params):
-        """
-        :param params: Either an abstract representation of the Ansatz containing all applicable parameters, or a
-                       list if `advanced_params=False`.
-        :return: The cost evaluation of the Ansatz with the given parameterization.
-        """
-        # Validate the format of the parameters, and set the parameters accordingly.
-        raise NotImplementedError
 
-
-class _GateType(Enum):
+class _GateType(IntEnum):
     U3 = 0
     IDENTITY = 1
     H = 2
@@ -94,12 +190,8 @@ class _GateType(Enum):
     CU3 = -2
 
     @staticmethod
-    def __converter():
-        converter = ("u3", "id", "h", "x", "y", "z", "s", "t", "rx", "ry", "rz")
-        return converter
-
-    @staticmethod
     def get_gate_type_from_string(gate_type):
+        # TODO Remove temporary hack with if statements
         if gate_type == "cx":
             return _GateType.CX
         if gate_type == "cu3":
@@ -144,76 +236,10 @@ class _GateType(Enum):
         else:
             return 0
 
-
-class _CircuitCell:
-    def __init__(self, gate_type, is_target: bool, qubit_index: int=None, depth_index: int=None, parameters=None):
-        """
-        :param gate_type: What type the gate is. Currently, controls are only supported as identity gates.
-        :param is_target: Any gate which is not a control, is a target. I.e. a target may have 0 or more controls.
-        """
-        self.__is_target = is_target
-        self.__gate_type = _GateType.get_gate_type_from_string(gate_type)
-        if parameters is None:
-            self.__parameters = []
-        else:
-            assert 0 <= len(parameters) <= 3, "[ASSERTION FAILURE] Gates with more than three parameters are not" \
-                                              + "supported."
-            self.__parameters = parameters
-
-        if qubit_index is not None and depth_index is not None:
-            self.__qubit = qubit_index
-            self.__depth = depth_index
-        elif (qubit_index is None) != (depth_index is None):
-            raise AssertionError("[ASSERTION FAILURE] If layer or qubit is specified, the qubit or layer must also be"
-                                 + "specified. Cannot specify one without the other.")
-        else:
-            self.__qubit = self.__depth = None
-        # The next target or control. If this is a target, this should always be None.
-        self.__next_cell = None
-        # The previous control, noting that a previous cell can never be a target.
-        self.__prev_cell = None
-
-    def get_parameters(self):
-        return self.__parameters
-
-    def set_parameters(self, parameters):
-        assert 0 <= len(parameters) <= 3, "[ASSERTION FAILURE] Gates with more than three parameters are not" \
-                                          + "supported."
-        self.__parameters = parameters
-
-    def get_type(self):
-        return self.__gate_type
-
-    def is_target(self):
-        return self.__is_target
-
-    def get_qubit(self):
-        return self.__qubit
-
-    def get_depth(self):
-        return self.__depth
-
-    def set_coordinates(self, qubit_index, depth_index):
-        """
-        Set the coordinates of this gate in the grid.
-        """
-        self.__qubit = qubit_index
-        self.__depth = depth_index
-
-    def set_next_cell(self, cell):
-        # This cell cannot link to another cell if this is a target, as targets are assumed to be terminal.
-        assert not self.__is_target, "[ASSERTION FAILURE] Cannot set a linked cell for a terminal target gate."
-        assert cell is not None, "[ASSERTION FAILURE] Cannot set next cell to None, is None by default."
-        self.__next_cell = cell
-
-    def set_prev_cell(self, cell):
-        self.__prev_cell = cell
-
-    def get_next_cell(self):
-        return self.__next_cell
-
-    def get_prev_cell(self):
-        return self.__prev_cell
+    @staticmethod
+    def __converter():
+        converter = ("u3", "id", "h", "x", "y", "z", "s", "t", "rx", "ry", "rz")
+        return converter
 
 
 class _QuantumCircuitRepresentation:
@@ -221,15 +247,30 @@ class _QuantumCircuitRepresentation:
         self.__num_qubits = num_qubits
         # self.__circuit is of the format [[[_CircuitCell], ...], ...]]
         # where self.__circuit[depth][qubit] is the access pattern
-        self.__circuit = [[] for _ in range(self.__num_qubits)]
-        self.__qr = QuantumRegister(self.__num_qubits, "qr")
+        self.__circuit = []
+        self.__qr = QuantumRegister(self.__num_qubits, "q")
         self.__backend = backend
         if self.__backend == "qasm_simulator":
-            self.__cr = ClassicalRegister(self.__num_qubits, name="cr")
+            self.__cr = ClassicalRegister(self.__num_qubits, name="c")
             self.__add_measure = True
         else:
             self.__cr = None
             self.__add_measure = False
+
+    def get_quantum_cell(self, depth, qubit):
+        min_list_len = len(min(self.__circuit, key=lambda x: len(x)))
+        assert (min_list_len != 0), "[ASSERTION FAILURE] Attempted to index an ansatz with no layers added."
+        assert 0 <= depth <= len(self.__circuit) - 1, "[ASSERTION FAILURE] Specified circuit layer (" + str(depth) \
+                                                      + ") is invalid."
+        assert 0 <= qubit <= self.__num_qubits - 1, "[ASSERTION FAILURE] Specified qubit index (" + str(qubit) \
+                                                         + ") is invalid."
+        return self.__circuit[depth][qubit]
+
+    def get_depth(self):
+        """
+        Returns the depth of the quantum circuit object.
+        """
+        return len(self.__circuit)
 
     def get_quantum_circuit(self):
         if self.__backend == "qasm_simulator":
@@ -240,7 +281,7 @@ class _QuantumCircuitRepresentation:
         for depth, layer in enumerate(self.__circuit):
             for qubit, cell in enumerate(layer):
                 is_cell_target = cell.is_target()
-                cell_type = cell.get_type()
+                cell_type = cell._get_type()
                 if (not is_cell_target) and (cell_type != _GateType.IDENTITY):
                     raise AssertionError("[ASSERTION FAILURE] Control must be an identity gate.")
                 controls = []
@@ -260,7 +301,7 @@ class _QuantumCircuitRepresentation:
                             qc.cx(self.__qr[controls[0].get_qubit()], self.__qr[qubit])
                         elif cell_type == _GateType.U3:
                             params = cell.get_parameters()
-                            assert len(params) == 3, "[ASSERTION FAILURE] CU3 Gate has the incorrect number of " +\
+                            assert len(params) == 3, "[ASSERTION FAILURE] CU3 gate has the incorrect number of " +\
                                                      "parameters specified."
                             qc.cu3(params[0], params[1], params[2], self.__qr[controls[0].get_qubit()], self.__qr[qubit])
                     elif len(controls) == 0:
@@ -322,7 +363,7 @@ class _QuantumCircuitRepresentation:
             cell_rank = _GateType.get_gate_qubit_rank(cell_label)
             if cell_rank == 1:
                 # All single qubit gates are implicitly their own targets.
-                new_cell = _CircuitCell(gate_type=cell_label, is_target=True, qubit_index=cell_target,
+                new_cell = CircuitCell(gate_type=cell_label, is_target=True, qubit_index=cell_target,
                                         depth_index=current_depth, parameters=cell_params)
                 new_layer[cell_target] = new_cell
             elif cell_rank == 2:
@@ -330,7 +371,7 @@ class _QuantumCircuitRepresentation:
                 control_list = []
                 for control in cell_controls:
                     # NOTE CONTROL CELLS CURRENTLY ONLY SUPPORT IDENTITY CONTROLS
-                    control_cell = _CircuitCell(gate_type='id', is_target=False, qubit_index=control,
+                    control_cell = CircuitCell(gate_type='id', is_target=False, qubit_index=control,
                                                 depth_index=current_depth)
                     new_layer[control] = control_cell
                     control_list.append(control_cell)
@@ -338,14 +379,14 @@ class _QuantumCircuitRepresentation:
                                                + "any control cells."
                 # Now create the target cell
                 target_cell_type = _GateType.get_target_type_as_string(cell_label)
-                target_cell = _CircuitCell(gate_type=target_cell_type, is_target=True, qubit_index=cell_target,
+                target_cell = CircuitCell(gate_type=target_cell_type, is_target=True, qubit_index=cell_target,
                                            depth_index=current_depth, parameters=cell_params)
                 control_cell = control_list.pop()
-                target_cell.set_prev_cell(control_cell)
-                control_cell.set_next_cell(target_cell)
+                target_cell._set_prev_cell(control_cell)
+                control_cell._set_next_cell(target_cell)
                 for control_cell_prime in control_list:
-                    control_cell_prime.set_next_cell(control_cell)
-                    control_cell.set_prev_cell(control_cell_prime)
+                    control_cell_prime._set_next_cell(control_cell)
+                    control_cell._set_prev_cell(control_cell_prime)
                     control_cell = control_cell_prime
                 new_layer[cell_target] = target_cell
             else:
@@ -356,17 +397,7 @@ class _QuantumCircuitRepresentation:
     def __set_specified_layer_parameters(self):
         raise NotImplementedError
 
-    def __set_parameters(self):
-        raise NotImplementedError
-
-
-class CircuitParameterization:
-    def __init__(self):
-        raise NotImplementedError
-
-
-
-
-
+    def __get_abstract_circuit(self):
+        return self.__circuit
 
 
