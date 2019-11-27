@@ -1,1 +1,3 @@
 *.idea/
+**/__pycache__/
+**/single_param_opt/

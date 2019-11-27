@@ -1,7 +1,5 @@
 """
-Find the optimal parameterization for a single parameter.
-
-This calculation for a single parameter is based off of: https://arxiv.org/pdf/1905.09692.pdf
+This is a wrapper enabling compatibility with arbitrary off-the-shelf optimizers.
 """
 import numpy as np
 from src.ansatz.ansatz import Ansatz, CircuitCell
@@ -16,6 +14,10 @@ class GenericOpt(Optimizer):
             self.optimizer = COBYLA(maxiter=maxiter, tol=tol)
         elif opt_name == "SLSQP":
             self.optimizer = SLSQP(maxiter=maxiter, tol=tol)
+        elif opt_name == "SPSA":
+            # self.optimizer = SPSA(max_trials=maxiter, c0=0.05, c1=0.05, c2=0.3, c3=0.2)
+            self.optimizer = SPSA(max_trials=maxiter, c0=0.05, c1=0.05, )
+            # self.optimizer = SPSA(max_trials=maxiter)
         else:
             raise AssertionError("[ASSERTION FAILURE] Unrecognized optimizer.")
 

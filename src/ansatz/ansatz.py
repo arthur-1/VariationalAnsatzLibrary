@@ -1,11 +1,9 @@
 from src.exceptions.exceptions import *
 import numpy as np
-from qiskit import Aer
-from qiskit.aqua import Operator
+from qiskit import Aer, BasicAer
 from enum import IntEnum
 from qiskit.aqua import QuantumInstance
 from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit
-from qiskit.aqua.operator import Operator
 
 
 class CircuitCell:
@@ -87,49 +85,64 @@ class CircuitCell:
 
 
 class AnsatzOperator:
-    def __init__(self, num_qubits: int, backend: str="statevector_simulator", shots: int=1024):
+    def __init__(self, get_operator, num_qubits: int, backend: str="statevector_simulator",
+                 shots: int=1024, seed: int=1):
         self.__num_qubits = num_qubits
+        self.__operator = get_operator(num_qubits, seed)
+        self.__backend_str = backend
         if backend == "statevector_simulator":
             self.__backend = Aer.get_backend(backend)
             self.__mode = "matrix"
             self.__quantum_instance = QuantumInstance(backend=self.__backend)
-            self.__operator = Matrix
         elif backend == "qasm_simulator":
             self.__backend = Aer.get_backend(backend)
             self.__mode = "grouped_paulis"
-            self.__quantum_instance = QuantumInstance(backend=self.__backend, shots=shots)
+            self.__quantum_instance = QuantumInstance(backend=self.__backend, shots=shots,
+                                                      skip_qobj_deepcopy=True
+                                                      )
         else:
             raise UnrecognizedInputError
 
-    def get_num_qubits(self):
+    def _get_num_qubits(self):
         return self.__num_qubits
 
-    def get_backend(self):
+    def _get_backend(self):
         return self.__backend
 
-    def get_mode(self):
+    def _get_mode(self):
         return self.__mode
 
-    def get_operator(self):
+    def _get_operator(self):
         return self.__operator
+
+    def _get_backend_str(self):
+        return self.__backend_str
+
+    def _get_quantum_instance(self):
+        return self.__quantum_instance
 
 
 class Ansatz:
-    def __init__(self, ansatz_operator: AnsatzOperator, log: bool=False, verbose: bool=False):
-        self.__num_qubits = ansatz_operator.get_num_qubits()
+    def __init__(self, ansatz_operator: AnsatzOperator, logging: bool=False, verbose: bool=False):
+        self.__num_qubits = ansatz_operator._get_num_qubits()
+        self.__quantum_instance = ansatz_operator._get_quantum_instance()
         self.__verbose = verbose
-        self.__qubit_operator = ansatz_operator.get_operator()
-
-        self.__abstract_quantum_circuit = _QuantumCircuitRepresentation(self.__num_qubits, backend)
+        self.__logging_enabled = logging
+        self.__log = []
+        self.__qubit_operator = ansatz_operator._get_operator()
+        self.__backend = ansatz_operator._get_backend()
+        backend_str = ansatz_operator._get_backend_str()
+        self.__mode = ansatz_operator._get_mode()
+        self.__abstract_quantum_circuit = _QuantumCircuitRepresentation(self.__num_qubits, backend_str)
 
     def __getitem__(self, key) -> CircuitCell:
         """
-        Accepts a key, indexed by [depth, qubit], and returns the CircuitCell object at the specified location.
+        Accepts a key, indexed by [qubit, depth], and returns the CircuitCell object at the specified location.
         """
         assert len(key) == 2, "[ASSERTION FAILURE] Attempted to index into an Ansatz object without specifying" \
                               + "depth and qubit."
-        depth = key[0]
-        qubit = key[1]
+        qubit = key[0]
+        depth = key[1]
         cell = self.__abstract_quantum_circuit.get_quantum_cell(depth, qubit)
         return cell
 
@@ -151,7 +164,25 @@ class Ansatz:
         cost = self.__cost_function()
         if self.__verbose:
             print(cost)
+        if self.__logging_enabled:
+            self.__log.append(cost)
         return cost
+
+    def clear_logs(self):
+        self.__log = []
+
+    def reset_parameters(self):
+        _n = self.get_num_qubits()
+        _d = self.get_depth()
+        for i in range(_n):
+            for ii in range(_d):
+                cell = self.__abstract_quantum_circuit.get_quantum_cell(ii, i)
+                params = cell.get_parameters()
+                new_params = [0] * len(params)
+                cell.set_parameters(new_params)
+
+    def get_logs(self):
+        return self.__log
 
     def append_layer(self, layer):
         """
@@ -250,17 +281,11 @@ class _QuantumCircuitRepresentation:
         self.__circuit = []
         self.__qr = QuantumRegister(self.__num_qubits, "q")
         self.__backend = backend
-        if self.__backend == "qasm_simulator":
-            self.__cr = ClassicalRegister(self.__num_qubits, name="c")
-            self.__add_measure = True
-        else:
-            self.__cr = None
-            self.__add_measure = False
 
     def get_quantum_cell(self, depth, qubit):
         min_list_len = len(min(self.__circuit, key=lambda x: len(x)))
         assert (min_list_len != 0), "[ASSERTION FAILURE] Attempted to index an ansatz with no layers added."
-        assert 0 <= depth <= len(self.__circuit) - 1, "[ASSERTION FAILURE] Specified circuit layer (" + str(depth) \
+        assert 0 <= depth <= self.get_depth() - 1, "[ASSERTION FAILURE] Specified circuit layer (" + str(depth) \
                                                       + ") is invalid."
         assert 0 <= qubit <= self.__num_qubits - 1, "[ASSERTION FAILURE] Specified qubit index (" + str(qubit) \
                                                          + ") is invalid."
@@ -273,10 +298,7 @@ class _QuantumCircuitRepresentation:
         return len(self.__circuit)
 
     def get_quantum_circuit(self):
-        if self.__backend == "qasm_simulator":
-            qc = QuantumCircuit(self.__qr, self.__cr)
-        else:
-            qc = QuantumCircuit(self.__qr)
+        qc = QuantumCircuit(self.__qr)
 
         for depth, layer in enumerate(self.__circuit):
             for qubit, cell in enumerate(layer):
@@ -334,9 +356,6 @@ class _QuantumCircuitRepresentation:
                             qc.rz(params[0], qubit)
                     else:
                         raise UnknownError
-        if self.__backend == "qasm_simulator":
-            for i in range(self.__num_qubits):
-                qc.measure(self.__qr[i], self.__cr[i])
         return qc
 
     def append_layer(self, layer: list):
